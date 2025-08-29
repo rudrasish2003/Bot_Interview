@@ -155,7 +155,7 @@ const startTest = async (req, res) => {
     
     const vapiCall = await twilioClient.calls.create({
       to: config.vapi.phoneNumber,
-      from: '+15005550006', // Twilio test number
+      from: '+16508661851', // Twilio test number
       twiml: `<Response>
         <Dial>
           <Conference 
