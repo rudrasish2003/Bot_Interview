@@ -303,13 +303,18 @@ app.get('/tests', (req, res) => {
 app.post('/twilio/voice', (req, res) => {
   const { CallSid, From, To } = req.body;
   logger.info('📞 Voice webhook received', { CallSid, From, To });
-  
+
   const twiml = new twilio.twiml.VoiceResponse();
-  twiml.say('Hello from AI Interview System');
-  
+  twiml.dial().conference({
+    statusCallback: `${config.twilio.webhookUrl}/twilio/conference-status`,
+    statusCallbackEvent: 'start end join leave',
+    statusCallbackMethod: 'POST'
+  }, 'AI_DefaultConference'); // fallback conference name if direct dial
+
   res.type('text/xml');
   res.send(twiml.toString());
 });
+
 
 app.post('/twilio/call-status', (req, res) => {
   const { CallSid, CallStatus, From, To } = req.body;
