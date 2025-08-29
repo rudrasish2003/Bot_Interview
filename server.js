@@ -1,16 +1,13 @@
-// Load environment variables first
-require('dotenv').config();
-
  
 
-// Utility functions
-// Twilio recording webhook
+
 const express = require('express');
 const twilio = require('twilio');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
 
 // Utility functions
 const logger = {
@@ -158,12 +155,14 @@ const createVapiAssistant = async (name, systemPrompt, voice = 'alloy') => {
   }
 };
 
-const createVapiCall = async (assistant, phoneNumber, conferenceNumber, participantType) => {
+const createVapiCall = async (assistantId, participantType) => {
   try {
+    // Use the correct Vapi API structure for outbound calls
     const response = await axios.post('https://api.vapi.ai/call', {
-      assistant: assistant, // Pass full assistant object instead of just ID
-      phoneNumber: phoneNumber,
-      customerNumber: conferenceNumber
+      assistantId: assistantId,
+      // For now, we'll just create the call and let Vapi handle the connection
+      // You may need to adjust this based on your Vapi configuration
+      type: 'outboundCall'
     }, {
       headers: {
         'Authorization': `Bearer ${config.vapi.apiKey}`,
@@ -298,13 +297,11 @@ const startTest = async (req, res) => {
 };
 
 // Method A: Create calls via phone numbers (if you have separate Vapi numbers)
-const createCallsViaPhone = async (runId, conferenceName, interviewerAssistant, candidateAssistant, res) => {
+const createCallsViaPhone = async (runId, conferenceName, interviewerAssistant, candidateAssistant, persona, res) => {
   try {
     logger.info('Creating conference calls to Vapi phone numbers...');
     
-    // Note: This method requires pre-configuring assistants on phone numbers in Vapi dashboard
-    // The transient assistants created above won't be used in this method
-    
+    // Call interviewer Vapi number
     const interviewerCall = await twilioClient.calls.create({
       to: config.vapi.interviewer.phoneNumber,
       from: '+16508661851',
@@ -353,46 +350,50 @@ const createCallsViaPhone = async (runId, conferenceName, interviewerAssistant, 
         });
 
         const testRun = storage.testRuns.get(runId);
-        testRun.participants = {
-          interviewer: { 
-            callSid: interviewerCall.sid,
-            phoneNumber: config.vapi.interviewer.phoneNumber,
-            assistantId: interviewerAssistant.id,
-            vendor: 'vapi',
-            role: 'interviewer',
-            status: 'calling'
-          },
-          candidate: { 
-            callSid: candidateCall.sid,
-            phoneNumber: config.vapi.candidate.phoneNumber,
-            assistantId: candidateAssistant.id,
-            vendor: 'vapi',
-            persona: persona,
-            role: 'candidate', 
-            status: 'calling'
-          }
-        };
-        testRun.status = 'running';
-        
-        saveEvent(runId, 'participants_added', testRun.participants);
+        if (testRun) {
+          testRun.participants = {
+            interviewer: { 
+              callSid: interviewerCall.sid,
+              phoneNumber: config.vapi.interviewer.phoneNumber,
+              assistantId: interviewerAssistant.id,
+              vendor: 'vapi',
+              role: 'interviewer',
+              status: 'calling'
+            },
+            candidate: { 
+              callSid: candidateCall.sid,
+              phoneNumber: config.vapi.candidate.phoneNumber,
+              assistantId: candidateAssistant.id,
+              vendor: 'vapi',
+              persona: persona,
+              role: 'candidate', 
+              status: 'calling'
+            }
+          };
+          testRun.status = 'running';
+          
+          saveEvent(runId, 'participants_added', testRun.participants);
+        }
 
       } catch (error) {
         logger.error('Failed to create candidate call:', error.message);
       }
     }, 3000);
 
-    res.json({
-      success: true,
-      runId,
-      conferenceName,
-      status: 'starting',
-      message: 'Calling both Vapi agents to join conference...',
-      method: 'phone_calls',
-      assistants: {
-        interviewer: interviewerAssistant.id,
-        candidate: candidateAssistant.id
-      }
-    });
+    if (res) {
+      res.json({
+        success: true,
+        runId,
+        conferenceName,
+        status: 'starting',
+        message: 'Calling both Vapi agents to join conference...',
+        method: 'phone_calls',
+        assistants: {
+          interviewer: interviewerAssistant.id,
+          candidate: candidateAssistant.id
+        }
+      });
+    }
 
   } catch (error) {
     logger.error('Failed to create phone calls:', error.message);
@@ -400,75 +401,22 @@ const createCallsViaPhone = async (runId, conferenceName, interviewerAssistant, 
   }
 };
 
-// Method B: Create calls directly via Vapi API (uses transient assistants)
-const createCallsViaAPI = async (runId, conferenceName, interviewerAssistant, candidateAssistant, res) => {
+// Method B: Simplified API approach - just create assistants and use phone method
+const createCallsViaAPI = async (runId, conferenceName, interviewerAssistant, candidateAssistant, persona, res) => {
   try {
-    logger.info('Creating Vapi calls via API with transient assistants...');
+    logger.info('API method not fully supported yet, using phone method...');
     
-    // Create a Twilio conference number that Vapi can call into
-    const conferenceNumber = '+16508661851'; // Your Twilio number
+    // For now, fall back to phone method since Vapi API integration is complex
+    // You would need to set up proper SIP/WebRTC integration for this to work
     
-    // Create interviewer call
-    const interviewerCall = await createVapiCall(
-      interviewerAssistant,
-      null, // No specific phone number needed for API calls
-      conferenceNumber,
-      'interviewer'
-    );
-    
-    // Wait a moment, then create candidate call
-    setTimeout(async () => {
-      try {
-        const candidateCall = await createVapiCall(
-          candidateAssistant,
-          null,
-          conferenceNumber, 
-          'candidate'
-        );
-
-        // Update test run
-        const testRun = storage.testRuns.get(runId);
-        testRun.participants = {
-          interviewer: { 
-            vapiCallId: interviewerCall.id,
-            assistantId: interviewerAssistant.id,
-            vendor: 'vapi',
-            role: 'interviewer',
-            status: 'connecting'
-          },
-          candidate: { 
-            vapiCallId: candidateCall.id,
-            assistantId: candidateAssistant.id,
-            vendor: 'vapi',
-            persona: persona,
-            role: 'candidate',
-            status: 'connecting'
-          }
-        };
-        testRun.status = 'running';
-        
-        saveEvent(runId, 'vapi_calls_created', testRun.participants);
-
-      } catch (error) {
-        logger.error('Failed to create candidate call:', error.message);
-      }
-    }, 2000);
-
-    res.json({
-      success: true,
-      runId,
-      conferenceName,
-      status: 'starting', 
-      message: 'Creating Vapi calls via API with custom prompts...',
-      method: 'vapi_api',
-      assistants: {
-        interviewer: interviewerAssistant.id,
-        candidate: candidateAssistant.id
-      }
-    });
+    if (config.vapi.interviewer.phoneNumber && config.vapi.candidate.phoneNumber) {
+      return await createCallsViaPhone(runId, conferenceName, interviewerAssistant, candidateAssistant, persona, res);
+    } else {
+      throw new Error('Phone numbers required for current implementation. Set VAPI_INTERVIEWER_PHONE and VAPI_CANDIDATE_PHONE.');
+    }
 
   } catch (error) {
-    logger.error('Vapi API call creation failed:', error.message);
+    logger.error('API call creation failed:', error.message);
     throw error;
   }
 };
@@ -675,6 +623,36 @@ app.post('/twilio/conference-status', (req, res) => {
       testRun.endTime = new Date().toISOString();
       logger.info(`Conference ${conferenceName} ended`);
     }
+  }
+  
+  res.sendStatus(200);
+});
+
+// Twilio recording webhook
+app.post('/twilio/recording-status', (req, res) => {
+  const { RecordingSid, RecordingStatus, RecordingUrl, CallSid } = req.body;
+  logger.info('Recording status update', { RecordingSid, RecordingStatus, RecordingUrl });
+  
+  // Find test run and save recording info
+  const testRun = Array.from(storage.testRuns.values())
+    .find(run => 
+      run.participants?.interviewer?.callSid === CallSid ||
+      run.participants?.candidate?.callSid === CallSid
+    );
+  
+  if (testRun && RecordingStatus === 'completed') {
+    if (!testRun.recordings) testRun.recordings = [];
+    testRun.recordings.push({
+      sid: RecordingSid,
+      url: RecordingUrl,
+      callSid: CallSid,
+      timestamp: new Date().toISOString()
+    });
+    
+    saveEvent(testRun.runId, 'recording_completed', { 
+      recordingSid: RecordingSid,
+      recordingUrl: RecordingUrl 
+    });
   }
   
   res.sendStatus(200);
