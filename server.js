@@ -1,3 +1,6 @@
+// Load environment variables first
+require('dotenv').config();
+
 const express = require('express');
 const twilio = require('twilio');
 const axios = require('axios');
@@ -17,9 +20,9 @@ const config = {
     webhookUrl: process.env.WEBHOOK_BASE_URL || 'https://your-ngrok-url.ngrok.io'
   },
   vapi: {
-    sipUri: process.env.VAPI_SIP_URI || 'sip:vapi@sip.vapi.ai',
     apiKey: process.env.VAPI_API_KEY,
-    assistantId: process.env.VAPI_ASSISTANT_ID
+    assistantId: process.env.VAPI_ASSISTANT_ID,
+    phoneNumber: process.env.VAPI_PHONE_NUMBER
   },
   ultravox: {
     apiKey: process.env.ULTRAVOX_API_KEY,
@@ -28,6 +31,23 @@ const config = {
   testTimeout: 5 * 60 * 1000, // 5 minutes
   port: process.env.PORT || 3000
 };
+
+// Validate required environment variables
+const requiredEnvVars = [
+  'TWILIO_ACCOUNT_SID',
+  'TWILIO_AUTH_TOKEN',
+  'VAPI_API_KEY',
+  'VAPI_ASSISTANT_ID',
+  'VAPI_PHONE_NUMBER',
+  'ULTRAVOX_API_KEY'
+];
+
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+if (missingVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingVars.join(', '));
+  console.error('💡 Please check your .env file and ensure all required variables are set.');
+  process.exit(1);
+}
 
 // Initialize Twilio client
 const twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
@@ -94,8 +114,41 @@ const saveTranscript = (runId, participantType, text, isFinal = false) => {
   });
 };
 
-// Ultravox API integration
-const createUltravoxCall = async (persona, runId) => {
+// Vapi API integration for outbound calls
+const createVapiCall = async (runId, conferenceSid) => {
+  try {
+    const callPayload = {
+      assistantId: config.vapi.assistantId,
+      customer: {
+        number: `conference:${conferenceSid}` // Special Twilio conference dial string
+      },
+      phoneNumberId: config.vapi.phoneNumber, // Your Vapi phone number ID
+      metadata: {
+        runId,
+        role: 'interviewer'
+      }
+    };
+
+    const response = await axios.post(
+      'https://api.vapi.ai/call',
+      callPayload,
+      {
+        headers: {
+          'Authorization': `Bearer ${config.vapi.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    return response.data;
+  } catch (error) {
+    logger.error('Failed to create Vapi call', error.response?.data || error.message);
+    throw error;
+  }
+};
+
+// Ultravox API integration - modified to work with conference
+const createUltravoxCall = async (persona, runId, conferenceSid) => {
   try {
     const selectedPersona = personas[persona] || personas.nervous;
     
@@ -103,14 +156,19 @@ const createUltravoxCall = async (persona, runId) => {
       systemPrompt: `You are a ${selectedPersona.name}. ${selectedPersona.description} 
         You are being interviewed for a software engineering position. 
         Respond naturally as this persona would. Keep responses concise but in character.
-        Traits: ${selectedPersona.traits.join(', ')}.`,
+        Traits: ${selectedPersona.traits.join(', ')}.
+        
+        You will be connected to a conference call with an interviewer. Wait for questions and respond appropriately.`,
       model: "fixie-ai/ultravox",
       voice: selectedPersona.voice,
       temperature: 0.7,
       maxDuration: 300, // 5 minutes
+      // Try to pass conference info if Ultravox supports it
+      callTarget: conferenceSid, 
       metadata: {
         runId,
-        persona: selectedPersona.name
+        persona: selectedPersona.name,
+        conferenceSid
       }
     };
 
@@ -152,11 +210,7 @@ const startTest = async (req, res) => {
 
     logger.info(`Conference created: ${conference.sid}`);
 
-    // Step 2: Create Ultravox call first (to get SIP URI)
-    const ultravoxCall = await createUltravoxCall(persona, runId);
-    const ultravoxSipUri = ultravoxCall.joinUrl || `sip:${ultravoxCall.callId}@sip.ultravox.ai`;
-
-    // Step 3: Store test run
+    // Step 2: Store test run
     storage.testRuns.set(runId, {
       runId,
       scenarioId,
@@ -169,27 +223,40 @@ const startTest = async (req, res) => {
 
     saveEvent(runId, 'test_started', { persona, scenarioId, conferenceSid: conference.sid });
 
-    // Step 4: Add Interview Bot (Vapi) first
+    // Step 3: Start both calls to join the conference
+    // Step 3a: Add Interview Bot (Vapi) via PSTN
     const vapiParticipant = await twilioClient.conferences(conference.sid)
       .participants
       .create({
-        to: config.vapi.sipUri,
+        to: config.vapi.phoneNumber, // Your Vapi phone number
         from: '+15005550006', // Twilio test number
         statusCallback: `${config.twilio.webhookUrl}/twilio/participant-status`,
         statusCallbackEvent: ['ringing', 'answered', 'completed'],
-        label: 'interviewer'
+        label: 'interviewer',
+        statusCallbackMethod: 'POST'
       });
 
     logger.info(`Vapi participant added: ${vapiParticipant.callSid}`);
 
-    // Wait a moment for first bot to settle
+    // Wait a moment for first bot to settle and answer
     setTimeout(async () => {
       try {
-        // Step 5: Add Candidate Bot (Ultravox)
+        // Step 3b: Create Ultravox call that joins the conference
+        const ultravoxCall = await createUltravoxCall(persona, runId, conference.sid);
+        let ultravoxTarget;
+        
+        if (ultravoxCall.joinUrl) {
+          // If Ultravox provides a SIP URI
+          ultravoxTarget = ultravoxCall.joinUrl;
+        } else {
+          // If Ultravox provides a phone number
+          ultravoxTarget = ultravoxCall.phoneNumber || `+1${ultravoxCall.callId}`;
+        }
+
         const ultravoxParticipant = await twilioClient.conferences(conference.sid)
           .participants
           .create({
-            to: ultravoxSipUri,
+            to: ultravoxTarget,
             from: '+15005550006',
             statusCallback: `${config.twilio.webhookUrl}/twilio/participant-status`,
             statusCallbackEvent: ['ringing', 'answered', 'completed'],
@@ -201,8 +268,8 @@ const startTest = async (req, res) => {
         // Update storage
         const testRun = storage.testRuns.get(runId);
         testRun.participants = {
-          interviewer: { callSid: vapiParticipant.callSid, vendor: 'vapi' },
-          candidate: { callSid: ultravoxParticipant.callSid, vendor: 'ultravox' }
+          interviewer: { callSid: vapiParticipant.callSid, vendor: 'vapi', phoneNumber: config.vapi.phoneNumber },
+          candidate: { callSid: ultravoxParticipant.callSid, vendor: 'ultravox', target: ultravoxTarget }
         };
         testRun.status = 'running';
 
@@ -214,7 +281,7 @@ const startTest = async (req, res) => {
       } catch (error) {
         logger.error(`Failed to add second participant for ${runId}`, error);
       }
-    }, 3000);
+    }, 5000); // Wait 5 seconds for Vapi to answer and settle
 
     res.json({
       success: true,
@@ -656,16 +723,36 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-// Start server
-app.listen(config.port, () => {
-  logger.info(`🚀 AI Interview System running on port ${config.port}`);
-  logger.info('📝 Configuration check:');
-  logger.info(`   Twilio Account: ${config.twilio.accountSid ? '✅' : '❌'}`);
-  logger.info(`   Webhook URL: ${config.twilio.webhookUrl}`);
-  logger.info(`   Vapi SIP: ${config.vapi.sipUri}`);
-  logger.info(`   Ultravox API: ${config.ultravox.apiUrl}`);
-  logger.info('\n🎯 Ready to start AI interview tests!');
-  logger.info('   Open http://localhost:' + config.port + ' to begin');
-});
+// Start server with proper error handling
+const startServer = async () => {
+  try {
+    // Test Twilio connection
+    const account = await twilioClient.api.accounts(config.twilio.accountSid).fetch();
+    logger.info('✅ Twilio connection verified', { accountName: account.friendlyName });
+    
+    app.listen(config.port, () => {
+      logger.info(`🚀 AI Interview System running on port ${config.port}`);
+      logger.info('📋 Configuration check:');
+      logger.info(`   Twilio Account: ${config.twilio.accountSid} ✅`);
+      logger.info(`   Webhook URL: ${config.twilio.webhookUrl}`);
+      logger.info(`   Vapi Phone: ${config.vapi.phoneNumber} ✅`);
+      logger.info(`   Vapi Assistant: ${config.vapi.assistantId ? '✅' : '❌'}`);
+      logger.info(`   Ultravox API: ${config.ultravox.apiUrl}`);
+      logger.info('\n🎯 Ready to start AI interview tests!');
+      logger.info('   Open http://localhost:' + config.port + ' to begin');
+    });
+    
+  } catch (error) {
+    logger.error('❌ Failed to start server:', error.message);
+    logger.error('💡 Common fixes:');
+    logger.error('   - Verify TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are correct');
+    logger.error('   - Check your internet connection');
+    logger.error('   - Ensure Twilio account is active');
+    process.exit(1);
+  }
+};
+
+// Start the server
+startServer();
 
 module.exports = app;
