@@ -9,6 +9,15 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 // Utility functions
+// Twilio recording webhook
+const express = require('express');
+const twilio = require('twilio');
+const axios = require('axios');
+const fs = require('fs').promises;
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+
+// Utility functions
 const logger = {
   info: (msg, data = {}) => console.log(`[INFO] ${msg}`, data),
   error: (msg, data = {}) => console.error(`[ERROR] ${msg}`, data),
@@ -130,7 +139,7 @@ const createVapiAssistant = async (name, systemPrompt, voice = 'alloy') => {
         temperature: 0.7
       },
       voice: {
-        provider: 'openai', // Changed from '11labs' to 'openai' for compatibility
+        provider: '11labs', // or 'openai'
         voiceId: voice
       },
       firstMessage: "Hello! I'm ready to begin.",
@@ -154,17 +163,13 @@ const createVapiAssistant = async (name, systemPrompt, voice = 'alloy') => {
   }
 };
 
-// Fixed createVapiCall function with correct API structure
-const createVapiCall = async (assistantId, toPhoneNumber, participantType) => {
+const createVapiCall = async (assistant, phoneNumber, conferenceNumber, participantType) => {
   try {
-    const callPayload = {
-      assistantId: assistantId, // Use assistantId instead of assistant object
-      customer: {
-        number: toPhoneNumber // Correct structure for phone number
-      }
-    };
-
-    const response = await axios.post('https://api.vapi.ai/call', callPayload, {
+    const response = await axios.post('https://api.vapi.ai/call', {
+      assistant: assistant, // Pass full assistant object instead of just ID
+      phoneNumber: phoneNumber,
+      customerNumber: conferenceNumber
+    }, {
       headers: {
         'Authorization': `Bearer ${config.vapi.apiKey}`,
         'Content-Type': 'application/json'
@@ -193,7 +198,7 @@ const deleteVapiAssistant = async (assistantId) => {
   }
 };
 
-// Fixed startTest function
+// Alternative approach: Use Twilio calls to Vapi numbers
 const startTest = async (req, res) => {
   const { persona = 'nervous', scenarioId = 'default' } = req.body;
   const runId = generateRunId();
@@ -202,6 +207,11 @@ const startTest = async (req, res) => {
   try {
     logger.info(`Starting test run ${runId} with persona: ${persona}`);
     
+    // Check if we have both Vapi phone numbers
+    if (!config.vapi.interviewer.phoneNumber || !config.vapi.candidate.phoneNumber) {
+      throw new Error('Both VAPI_INTERVIEWER_PHONE and VAPI_CANDIDATE_PHONE are required');
+    }
+
     // Store test run
     storage.testRuns.set(runId, {
       runId,
@@ -215,39 +225,71 @@ const startTest = async (req, res) => {
 
     saveEvent(runId, 'test_started', { persona, scenarioId, conferenceName });
 
-    // Create transient assistants with selected persona
-    const selectedPersona = personas[persona];
-    if (!selectedPersona) {
-      throw new Error(`Invalid persona: ${persona}`);
-    }
+    // Method 1: Direct Vapi API calls (preferred if available)
+    if (config.vapi.interviewer.assistantId && config.vapi.candidate.assistantId) {
+      try {
+        logger.info('Creating Vapi calls via API...');
+        
+        // Create interviewer call
+        const interviewerCall = await createVapiCall(
+          config.vapi.interviewer.assistantId,
+          config.vapi.interviewer.phoneNumber,
+          `conference:${conferenceName}`,
+          'interviewer'
+        );
+        
+        // Wait a moment, then create candidate call
+        setTimeout(async () => {
+          try {
+            const candidateCall = await createVapiCall(
+              config.vapi.candidate.assistantId,
+              config.vapi.candidate.phoneNumber,
+              `conference:${conferenceName}`,
+              'candidate'
+            );
 
-    // Create interviewer assistant
-    const interviewerAssistant = await createVapiAssistant(
-      'AI Interviewer',
-      'You are a professional interviewer conducting a job interview. Ask relevant questions about the candidate\'s experience, skills, and motivations. Be friendly but professional. Ask follow-up questions based on their responses.',
-      'alloy'
-    );
+            // Update test run with call details
+            const testRun = storage.testRuns.get(runId);
+            testRun.participants = {
+              interviewer: { 
+                vapiCallId: interviewerCall.id,
+                assistantId: config.vapi.interviewer.assistantId,
+                vendor: 'vapi',
+                status: 'connecting'
+              },
+              candidate: { 
+                vapiCallId: candidateCall.id,
+                assistantId: config.vapi.candidate.assistantId,
+                vendor: 'vapi',
+                persona: persona,
+                status: 'connecting'
+              }
+            };
+            testRun.status = 'running';
+            
+            saveEvent(runId, 'vapi_calls_created', testRun.participants);
+          } catch (error) {
+            logger.error('Failed to create candidate call:', error.message);
+          }
+        }, 2000);
 
-    // Create candidate assistant with selected persona
-    const candidateAssistant = await createVapiAssistant(
-      selectedPersona.name,
-      selectedPersona.systemPrompt,
-      selectedPersona.voice
-    );
+        res.json({
+          success: true,
+          runId,
+          conferenceName,
+          status: 'starting',
+          message: 'Creating Vapi calls via API...',
+          method: 'vapi_api'
+        });
 
-    // Store assistant IDs for cleanup
-    const testRun = storage.testRuns.get(runId);
-    testRun.assistants = {
-      interviewer: interviewerAssistant.id,
-      candidate: candidateAssistant.id
-    };
-
-    // Try Vapi API method first, then fall back to phone calls
-    if (config.vapi.interviewer.phoneNumber && config.vapi.candidate.phoneNumber) {
-      await createCallsViaPhone(runId, conferenceName, persona, interviewerAssistant, candidateAssistant, res);
+      } catch (error) {
+        logger.error('Vapi API method failed, falling back to phone calls:', error.message);
+        // Fall back to phone call method
+        await createCallsViaPhone(runId, conferenceName, persona, res);
+      }
     } else {
-      // Try direct Vapi API calls (this requires different setup)
-      await createCallsViaAPI(runId, conferenceName, interviewerAssistant, candidateAssistant, res);
+      // Method 2: Phone calls to Vapi numbers
+      await createCallsViaPhone(runId, conferenceName, persona, res);
     }
 
   } catch (error) {
@@ -260,10 +302,13 @@ const startTest = async (req, res) => {
   }
 };
 
-// Fixed createCallsViaPhone function with proper parameter handling
-const createCallsViaPhone = async (runId, conferenceName, persona, interviewerAssistant, candidateAssistant, res) => {
+// Method A: Create calls via phone numbers (if you have separate Vapi numbers)
+const createCallsViaPhone = async (runId, conferenceName, interviewerAssistant, candidateAssistant, res) => {
   try {
     logger.info('Creating conference calls to Vapi phone numbers...');
+    
+    // Note: This method requires pre-configuring assistants on phone numbers in Vapi dashboard
+    // The transient assistants created above won't be used in this method
     
     const interviewerCall = await twilioClient.calls.create({
       to: config.vapi.interviewer.phoneNumber,
@@ -360,17 +405,19 @@ const createCallsViaPhone = async (runId, conferenceName, persona, interviewerAs
   }
 };
 
-// Fixed createCallsViaAPI function with correct Vapi API structure
+// Method B: Create calls directly via Vapi API (uses transient assistants)
 const createCallsViaAPI = async (runId, conferenceName, interviewerAssistant, candidateAssistant, res) => {
   try {
     logger.info('Creating Vapi calls via API with transient assistants...');
     
-    // For API calls, you would typically call the assistants directly
-    // This method assumes you have a way to route calls to a conference
+    // Create a Twilio conference number that Vapi can call into
+    const conferenceNumber = '+16508661851'; // Your Twilio number
     
+    // Create interviewer call
     const interviewerCall = await createVapiCall(
-      interviewerAssistant.id,
-      config.vapi.interviewer.phoneNumber || '+1234567890', // Default fallback
+      interviewerAssistant,
+      null, // No specific phone number needed for API calls
+      conferenceNumber,
       'interviewer'
     );
     
@@ -378,11 +425,13 @@ const createCallsViaAPI = async (runId, conferenceName, interviewerAssistant, ca
     setTimeout(async () => {
       try {
         const candidateCall = await createVapiCall(
-          candidateAssistant.id,
-          config.vapi.candidate.phoneNumber || '+1234567891', // Default fallback
+          candidateAssistant,
+          null,
+          conferenceNumber, 
           'candidate'
         );
 
+        // Update test run
         const testRun = storage.testRuns.get(runId);
         testRun.participants = {
           interviewer: { 
@@ -740,7 +789,7 @@ app.get('/', (req, res) => {
         <div class="container">
             <div class="header">
                 <h1>AI Interview Test System</h1>
-                <p>Dual Vapi Agent Configuration - Fixed Version</p>
+                <p>Dual Vapi Agent Configuration</p>
             </div>
 
             <div class="config-info">
@@ -750,6 +799,15 @@ app.get('/', (req, res) => {
                 • Environment variables: VAPI_INTERVIEWER_PHONE, VAPI_CANDIDATE_PHONE, VAPI_INTERVIEWER_ASSISTANT_ID, VAPI_CANDIDATE_ASSISTANT_ID
             </div>
             
+            <div class="form-group">
+                <label for="persona">Select Candidate Persona:</label>
+                <select id="persona" style="width: 100%;">
+                    <option value="nervous">Nervous Fresher - Anxious recent graduate</option>
+                    <option value="confident">Overconfident Candidate - Assertive and direct</option>
+                    <option value="experienced">Senior Professional - Calm and experienced</option>
+                </select>
+            </div>
+
             <div class="form-group">
                 <button onclick="startTest()" style="width: 200px; margin-right: 10px;">Start Test</button>
                 <button onclick="loadTests()" style="width: 150px; background: #28a745;">Refresh</button>
@@ -1035,4 +1093,4 @@ process.on('SIGTERM', () => {
 });
 
 // Start the server
-startServer(); 
+startServer();
