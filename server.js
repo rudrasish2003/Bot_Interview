@@ -144,9 +144,9 @@ const startTest = async (req, res) => {
 
     saveEvent(runId, 'test_started', { persona, scenarioId, conferenceName });
 
-    // Step 1: Add Vapi interviewer
+    // Step 1: Dial Vapi interviewer
     logger.info(`Dialing Vapi interviewer into ${conferenceName}`);
-    const vapiCall = await twilioClient.calls.create({
+    const vapiInterviewerCall = await twilioClient.calls.create({
       to: config.vapi.phoneNumber,
       from: '+16508661851', // your Twilio number
       twiml: `<Response>
@@ -164,44 +164,43 @@ const startTest = async (req, res) => {
       statusCallbackMethod: 'POST'
     });
 
-    // Step 2: Ask Ultravox API to join the same conference
-    logger.info(`Requesting Ultravox candidate (${persona}) to join ${conferenceName}`);
-    const uvxResp = await axios.post(
-      `${config.ultravox.apiUrl}/sessions`,
-      {
-        voice: personas[persona].voice,
-        traits: personas[persona].traits,
-        join: {
-          type: "twilio-conference",
-          conferenceName,
-          twilioAccountSid: config.twilio.accountSid,
-          twilioAuthToken: config.twilio.authToken
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${config.ultravox.apiKey}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+    // Step 2: Dial Vapi candidate (second agent)
+    logger.info(`Dialing Vapi candidate (${persona}) into ${conferenceName}`);
+    const vapiCandidateCall = await twilioClient.calls.create({
+      to: config.vapi.phoneNumber,
+      from: '+16508661851',
+      twiml: `<Response>
+        <Dial>
+          <Conference 
+            statusCallback="${config.twilio.webhookUrl}/twilio/conference-status" 
+            statusCallbackEvent="start,end,join,leave"
+            statusCallbackMethod="POST">
+            ${conferenceName}
+          </Conference>
+        </Dial>
+      </Response>`,
+      statusCallback: `${config.twilio.webhookUrl}/twilio/call-status`,
+      statusCallbackEvent: ['answered', 'completed'],
+      statusCallbackMethod: 'POST'
+    });
 
-    logger.info(`✅ Ultravox session created: ${uvxResp.data.sessionId}`);
-
-    // Save participants
+    // Save both participants
     const testRun = storage.testRuns.get(runId);
     testRun.participants = {
       interviewer: {
-        callSid: vapiCall.sid,
+        callSid: vapiInterviewerCall.sid,
         vendor: 'vapi',
+        role: 'interviewer',
         phoneNumber: config.vapi.phoneNumber,
         status: 'calling'
       },
       candidate: {
-        vendor: 'ultravox',
+        callSid: vapiCandidateCall.sid,
+        vendor: 'vapi',
+        role: 'candidate',
         persona,
-        sessionId: uvxResp.data.sessionId,
-        status: 'joining'
+        phoneNumber: config.vapi.phoneNumber,
+        status: 'calling'
       }
     };
     testRun.status = 'running';
@@ -216,7 +215,7 @@ const startTest = async (req, res) => {
       runId,
       conferenceName,
       status: 'starting',
-      message: 'Vapi and Ultravox are joining the conference...'
+      message: 'Both Vapi agents (interviewer + candidate) are joining the conference...'
     });
 
   } catch (error) {
