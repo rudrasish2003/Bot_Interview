@@ -123,26 +123,20 @@ const startTest = async (req, res) => {
   const { persona = 'nervous', scenarioId = 'default' } = req.body;
   const runId = generateRunId();
   const conferenceName = `AI_Interview_${runId}`;
-  
+
   try {
     logger.info(`Starting test run ${runId} with persona: ${persona}`);
-    
-    // Test Twilio client first
-    if (!twilioClient) {
-      throw new Error('Twilio client not initialized');
-    }
 
-    // Validate required configurations
     if (!config.vapi.phoneNumber) {
       throw new Error('VAPI_PHONE_NUMBER is required but not configured');
     }
 
-    // Store test run (conference will be created when first participant joins)
+    // Store test run
     storage.testRuns.set(runId, {
       runId,
       scenarioId,
       persona,
-      conferenceName: conferenceName,
+      conferenceName,
       status: 'starting',
       startTime: new Date().toISOString(),
       participants: {}
@@ -150,12 +144,11 @@ const startTest = async (req, res) => {
 
     saveEvent(runId, 'test_started', { persona, scenarioId, conferenceName });
 
-    // Step 1: Create a call to Vapi (interviewer) that joins the conference
-    logger.info(`Adding Vapi interviewer to conference: ${conferenceName}`);
-    
+    // Step 1: Add Vapi interviewer
+    logger.info(`Dialing Vapi interviewer into ${conferenceName}`);
     const vapiCall = await twilioClient.calls.create({
       to: config.vapi.phoneNumber,
-      from: '+16508661851', // Twilio test number
+      from: '+16508661851', // your Twilio number
       twiml: `<Response>
         <Dial>
           <Conference 
@@ -171,59 +164,52 @@ const startTest = async (req, res) => {
       statusCallbackMethod: 'POST'
     });
 
-    logger.info(`✅ Vapi call created: ${vapiCall.sid}`);
+    // Step 2: Add Ultravox candidate
+    logger.info(`Dialing Ultravox candidate (${persona}) into ${conferenceName}`);
+    const ultravoxCall = await twilioClient.calls.create({
+      // For now, pretend Ultravox is just a phone number.
+      // Replace this with the Ultravox SIP endpoint or webhook that connects them.
+      to: process.env.ULTRAVOX_PHONE || '+1234567890',
+      from: '+16508661851',
+      twiml: `<Response>
+        <Dial>
+          <Conference 
+            statusCallback="${config.twilio.webhookUrl}/twilio/conference-status"
+            statusCallbackEvent="start,end,join,leave"
+            statusCallbackMethod="POST">
+            ${conferenceName}
+          </Conference>
+        </Dial>
+      </Response>`,
+      statusCallback: `${config.twilio.webhookUrl}/twilio/call-status`,
+      statusCallbackEvent: ['answered', 'completed'],
+      statusCallbackMethod: 'POST'
+    });
 
-    // Wait a few seconds for Vapi to answer, then add Ultravox
-    setTimeout(async () => {
-      try {
-        // Create Ultravox call (this is a simplified approach - you'll need to integrate with Ultravox properly)
-        logger.info(`Adding Ultravox candidate (${persona}) to conference: ${conferenceName}`);
-        
-        // For now, we'll create a placeholder for the Ultravox integration
-        // In a real implementation, you'd create an Ultravox call that dials into the conference
-        
-        const testRun = storage.testRuns.get(runId);
-        testRun.participants = {
-          interviewer: { 
-            callSid: vapiCall.sid, 
-            vendor: 'vapi', 
-            phoneNumber: config.vapi.phoneNumber,
-            status: 'calling'
-          },
-          candidate: { 
-            vendor: 'ultravox', 
-            persona: persona,
-            status: 'pending'
-          }
-        };
-        testRun.status = 'running';
-        
-        saveEvent(runId, 'participants_added', testRun.participants);
+    // Save participants
+    const testRun = storage.testRuns.get(runId);
+    testRun.participants = {
+      interviewer: { callSid: vapiCall.sid, vendor: 'vapi', phoneNumber: config.vapi.phoneNumber, status: 'calling' },
+      candidate: { callSid: ultravoxCall.sid, vendor: 'ultravox', persona, status: 'calling' }
+    };
+    testRun.status = 'running';
 
-        // Set timeout to auto-stop test after 5 minutes
-        setTimeout(() => stopTest(runId), config.testTimeout);
-        
-      } catch (error) {
-        logger.error(`❌ Failed to add Ultravox participant:`, error.message);
-      }
-    }, 5000);
+    saveEvent(runId, 'participants_added', testRun.participants);
+
+    // Auto-stop after timeout
+    setTimeout(() => stopTest(runId), config.testTimeout);
 
     res.json({
       success: true,
       runId,
-      conferenceName: conferenceName,
+      conferenceName,
       status: 'starting',
-      message: 'Test initiated! Vapi interviewer is joining conference...'
+      message: 'Both Vapi and Ultravox are joining the conference...'
     });
 
   } catch (error) {
     logger.error(`❌ Failed to start test ${runId}:`, error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      runId,
-      details: 'Check server logs for more information'
-    });
+    res.status(500).json({ success: false, error: error.message, runId });
   }
 };
 
