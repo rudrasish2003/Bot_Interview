@@ -118,10 +118,11 @@ const saveTranscript = (runId, participantType, text, isFinal = false) => {
   });
 };
 
-// Simplified test function with better error handling
+// Corrected test function - conferences are created by adding participants, not directly
 const startTest = async (req, res) => {
   const { persona = 'nervous', scenarioId = 'default' } = req.body;
   const runId = generateRunId();
+  const conferenceName = `AI_Interview_${runId}`;
   
   try {
     logger.info(`Starting test run ${runId} with persona: ${persona}`);
@@ -131,36 +132,88 @@ const startTest = async (req, res) => {
       throw new Error('Twilio client not initialized');
     }
 
-    // Create Twilio Conference with simpler configuration
-    const conference = await twilioClient.conferences.create({
-      friendlyName: `AI_Interview_${runId}`,
-      statusCallback: `${config.twilio.webhookUrl}/twilio/status`,
-      statusCallbackEvent: ['start', 'end'],
-      endConferenceOnExit: false,
-      maxParticipants: 3
-    });
+    // Validate required configurations
+    if (!config.vapi.phoneNumber) {
+      throw new Error('VAPI_PHONE_NUMBER is required but not configured');
+    }
 
-    logger.info(`✅ Conference created: ${conference.sid}`);
-
-    // Store test run
+    // Store test run (conference will be created when first participant joins)
     storage.testRuns.set(runId, {
       runId,
       scenarioId,
       persona,
-      conferenceSid: conference.sid,
-      status: 'created',
+      conferenceName: conferenceName,
+      status: 'starting',
       startTime: new Date().toISOString(),
       participants: {}
     });
 
-    saveEvent(runId, 'test_started', { persona, scenarioId, conferenceSid: conference.sid });
+    saveEvent(runId, 'test_started', { persona, scenarioId, conferenceName });
+
+    // Step 1: Create a call to Vapi (interviewer) that joins the conference
+    logger.info(`Adding Vapi interviewer to conference: ${conferenceName}`);
+    
+    const vapiCall = await twilioClient.calls.create({
+      to: config.vapi.phoneNumber,
+      from: '+15005550006', // Twilio test number
+      twiml: `<Response>
+        <Dial>
+          <Conference 
+            statusCallback="${config.twilio.webhookUrl}/twilio/conference-status" 
+            statusCallbackEvent="start,end,join,leave"
+            statusCallbackMethod="POST">
+            ${conferenceName}
+          </Conference>
+        </Dial>
+      </Response>`,
+      statusCallback: `${config.twilio.webhookUrl}/twilio/call-status`,
+      statusCallbackEvent: ['answered', 'completed'],
+      statusCallbackMethod: 'POST'
+    });
+
+    logger.info(`✅ Vapi call created: ${vapiCall.sid}`);
+
+    // Wait a few seconds for Vapi to answer, then add Ultravox
+    setTimeout(async () => {
+      try {
+        // Create Ultravox call (this is a simplified approach - you'll need to integrate with Ultravox properly)
+        logger.info(`Adding Ultravox candidate (${persona}) to conference: ${conferenceName}`);
+        
+        // For now, we'll create a placeholder for the Ultravox integration
+        // In a real implementation, you'd create an Ultravox call that dials into the conference
+        
+        const testRun = storage.testRuns.get(runId);
+        testRun.participants = {
+          interviewer: { 
+            callSid: vapiCall.sid, 
+            vendor: 'vapi', 
+            phoneNumber: config.vapi.phoneNumber,
+            status: 'calling'
+          },
+          candidate: { 
+            vendor: 'ultravox', 
+            persona: persona,
+            status: 'pending'
+          }
+        };
+        testRun.status = 'running';
+        
+        saveEvent(runId, 'participants_added', testRun.participants);
+
+        // Set timeout to auto-stop test after 5 minutes
+        setTimeout(() => stopTest(runId), config.testTimeout);
+        
+      } catch (error) {
+        logger.error(`❌ Failed to add Ultravox participant:`, error.message);
+      }
+    }, 5000);
 
     res.json({
       success: true,
       runId,
-      conferenceSid: conference.sid,
-      status: 'created',
-      message: 'Test conference created successfully!'
+      conferenceName: conferenceName,
+      status: 'starting',
+      message: 'Test initiated! Vapi interviewer is joining conference...'
     });
 
   } catch (error) {
@@ -174,7 +227,7 @@ const startTest = async (req, res) => {
   }
 };
 
-// Stop test function
+// Updated stop test function
 const stopTest = async (runId) => {
   try {
     const testRun = storage.testRuns.get(runId);
@@ -184,10 +237,15 @@ const stopTest = async (runId) => {
 
     logger.info(`Stopping test run ${runId}`);
 
-    // End the conference
-    if (testRun.conferenceSid) {
-      await twilioClient.conferences(testRun.conferenceSid)
-        .update({ status: 'completed' });
+    // End any active calls
+    if (testRun.participants?.interviewer?.callSid) {
+      try {
+        await twilioClient.calls(testRun.participants.interviewer.callSid)
+          .update({ status: 'completed' });
+        logger.info(`✅ Ended interviewer call: ${testRun.participants.interviewer.callSid}`);
+      } catch (error) {
+        logger.error(`Failed to end interviewer call: ${error.message}`);
+      }
     }
 
     // Update status
@@ -243,7 +301,7 @@ app.get('/tests', (req, res) => {
   res.json({ success: true, tests });
 });
 
-// Twilio webhooks
+// Twilio webhooks - Updated for conference handling
 app.post('/twilio/voice', (req, res) => {
   const { CallSid, From, To } = req.body;
   logger.info('📞 Voice webhook received', { CallSid, From, To });
@@ -255,21 +313,75 @@ app.post('/twilio/voice', (req, res) => {
   res.send(twiml.toString());
 });
 
-app.post('/twilio/status', (req, res) => {
-  const { ConferenceSid, StatusCallbackEvent, FriendlyName } = req.body;
-  logger.info('📊 Conference status event', { ConferenceSid, StatusCallbackEvent, FriendlyName });
+app.post('/twilio/call-status', (req, res) => {
+  const { CallSid, CallStatus, From, To } = req.body;
+  logger.info('📞 Call status update', { CallSid, CallStatus, From, To });
   
+  // Update participant status based on call status
   const testRun = Array.from(storage.testRuns.values())
-    .find(run => run.conferenceSid === ConferenceSid);
+    .find(run => run.participants?.interviewer?.callSid === CallSid);
   
   if (testRun) {
-    saveEvent(testRun.runId, 'conference_event', { 
-      event: StatusCallbackEvent,
-      conferenceSid: ConferenceSid 
+    if (testRun.participants.interviewer) {
+      testRun.participants.interviewer.status = CallStatus;
+      if (CallStatus === 'answered') {
+        testRun.participants.interviewer.connectTime = new Date().toISOString();
+      } else if (CallStatus === 'completed') {
+        testRun.participants.interviewer.disconnectTime = new Date().toISOString();
+      }
+    }
+    
+    saveEvent(testRun.runId, 'call_status', { 
+      callSid: CallSid,
+      status: CallStatus,
+      participant: 'interviewer'
     });
   }
   
   res.sendStatus(200);
+});
+
+app.post('/twilio/conference-status', (req, res) => {
+  const { ConferenceSid, StatusCallbackEvent, FriendlyName } = req.body;
+  logger.info('🏛️ Conference status event', { ConferenceSid, StatusCallbackEvent, FriendlyName });
+  
+  // Find test run by conference name
+  const conferenceName = FriendlyName;
+  const testRun = Array.from(storage.testRuns.values())
+    .find(run => run.conferenceName === conferenceName);
+  
+  if (testRun) {
+    // Store the conference SID when it's created
+    if (!testRun.conferenceSid && ConferenceSid) {
+      testRun.conferenceSid = ConferenceSid;
+    }
+    
+    saveEvent(testRun.runId, 'conference_event', { 
+      event: StatusCallbackEvent,
+      conferenceSid: ConferenceSid,
+      conferenceName: conferenceName
+    });
+
+    // Update test status based on conference events
+    if (StatusCallbackEvent === 'conference-start') {
+      testRun.status = 'running';
+    } else if (StatusCallbackEvent === 'conference-end') {
+      testRun.status = 'completed';
+      testRun.endTime = new Date().toISOString();
+    }
+  }
+  
+  res.sendStatus(200);
+});
+
+// Keep the old endpoint for backward compatibility
+app.post('/twilio/status', (req, res) => {
+  const { ConferenceSid, StatusCallbackEvent, FriendlyName } = req.body;
+  logger.info('📊 Legacy status event', { ConferenceSid, StatusCallbackEvent, FriendlyName });
+  
+  // Forward to conference status handler
+  req.body.FriendlyName = FriendlyName || `AI_Interview_${ConferenceSid}`;
+  return app.handle(req, res, '/twilio/conference-status');
 });
 
 // Health check endpoint
@@ -287,20 +399,31 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint
+// Debug endpoint - Updated for new approach
 app.get('/debug/twilio', async (req, res) => {
   try {
     const account = await twilioClient.api.accounts(config.twilio.accountSid).fetch();
+    
+    // Test the calls API (which we're now using)
+    const callsAvailable = typeof twilioClient.calls.create === 'function';
+    
     res.json({
       success: true,
       account: account.friendlyName,
-      conferencesAvailable: typeof twilioClient.conferences.create === 'function',
-      twilioVersion: require('twilio/package.json').version
+      callsApiAvailable: callsAvailable,
+      conferencesNote: "Conferences are created via TwiML when calls are made",
+      twilioVersion: require('twilio/package.json').version,
+      nodeVersion: process.version,
+      config: {
+        webhookUrl: config.twilio.webhookUrl,
+        vapiPhone: config.vapi.phoneNumber || 'Not configured'
+      }
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      stack: error.stack
     });
   }
 });
