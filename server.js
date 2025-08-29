@@ -49,8 +49,18 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-// Initialize Twilio client
-const twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
+// Initialize Twilio client with error handling
+let twilioClient;
+try {
+  if (!config.twilio.accountSid || !config.twilio.authToken) {
+    throw new Error('Twilio credentials missing');
+  }
+  twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
+  logger.info('Twilio client initialized successfully');
+} catch (error) {
+  logger.error('Failed to initialize Twilio client:', error.message);
+  process.exit(1);
+}
 
 // In-memory storage for demo (replace with database)
 const storage = {
@@ -197,6 +207,11 @@ const startTest = async (req, res) => {
   
   try {
     logger.info(`Starting test run ${runId} with persona: ${persona}`);
+    
+    // Debug: Check if twilioClient is properly initialized
+    if (!twilioClient || typeof twilioClient.conferences !== 'object') {
+      throw new Error('Twilio client not properly initialized');
+    }
     
     // Step 1: Create Twilio Conference
     const conference = await twilioClient.conferences.create({
@@ -727,8 +742,16 @@ process.on('SIGTERM', async () => {
 const startServer = async () => {
   try {
     // Test Twilio connection
+    logger.info('Testing Twilio connection...');
     const account = await twilioClient.api.accounts(config.twilio.accountSid).fetch();
     logger.info('✅ Twilio connection verified', { accountName: account.friendlyName });
+    
+    // Test conferences API
+    logger.info('Testing Twilio conferences API...');
+    if (typeof twilioClient.conferences.create !== 'function') {
+      throw new Error('Twilio conferences API not available - check SDK version');
+    }
+    logger.info('✅ Twilio conferences API available');
     
     app.listen(config.port, () => {
       logger.info(`🚀 AI Interview System running on port ${config.port}`);
@@ -748,6 +771,7 @@ const startServer = async () => {
     logger.error('   - Verify TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are correct');
     logger.error('   - Check your internet connection');
     logger.error('   - Ensure Twilio account is active');
+    logger.error('   - Update Twilio SDK: npm install twilio@latest');
     process.exit(1);
   }
 };
