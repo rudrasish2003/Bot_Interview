@@ -8,16 +8,19 @@ const fs = require('fs').promises;
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Utility functions (define first)
+const logger = {
+  info: (msg, data = {}) => console.log(`[INFO] ${msg}`, data),
+  error: (msg, data = {}) => console.error(`[ERROR] ${msg}`, data),
+  debug: (msg, data = {}) => console.log(`[DEBUG] ${msg}`, data)
+};
 
 // Configuration
 const config = {
   twilio: {
     accountSid: process.env.TWILIO_ACCOUNT_SID,
     authToken: process.env.TWILIO_AUTH_TOKEN,
-    webhookUrl: process.env.WEBHOOK_BASE_URL || 'https://your-ngrok-url.ngrok.io'
+    webhookUrl: process.env.WEBHOOK_BASE_URL || 'https://bot-interview.onrender.com'
   },
   vapi: {
     apiKey: process.env.VAPI_API_KEY,
@@ -35,32 +38,30 @@ const config = {
 // Validate required environment variables
 const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
-  'TWILIO_AUTH_TOKEN',
-  'VAPI_API_KEY',
-  'VAPI_ASSISTANT_ID',
-  'VAPI_PHONE_NUMBER',
-  'ULTRAVOX_API_KEY'
+  'TWILIO_AUTH_TOKEN'
 ];
 
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:', missingVars.join(', '));
-  console.error('💡 Please check your .env file and ensure all required variables are set.');
+  logger.error('❌ Missing required environment variables:', missingVars.join(', '));
+  logger.error('💡 Please check your environment variables on Render.');
   process.exit(1);
 }
 
-// Initialize Twilio client with error handling
+// Initialize Twilio client
 let twilioClient;
 try {
-  if (!config.twilio.accountSid || !config.twilio.authToken) {
-    throw new Error('Twilio credentials missing');
-  }
   twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
-  logger.info('Twilio client initialized successfully');
+  logger.info('✅ Twilio client initialized successfully');
 } catch (error) {
-  logger.error('Failed to initialize Twilio client:', error.message);
+  logger.error('❌ Failed to initialize Twilio client:', error.message);
   process.exit(1);
 }
+
+// Initialize Express app
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // In-memory storage for demo (replace with database)
 const storage = {
@@ -91,13 +92,6 @@ const personas = {
   }
 };
 
-// Utility functions
-const logger = {
-  info: (msg, data = {}) => console.log(`[INFO] ${msg}`, data),
-  error: (msg, data = {}) => console.error(`[ERROR] ${msg}`, data),
-  debug: (msg, data = {}) => console.log(`[DEBUG] ${msg}`, data)
-};
-
 const generateRunId = () => `run_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
 // Storage helpers
@@ -124,83 +118,7 @@ const saveTranscript = (runId, participantType, text, isFinal = false) => {
   });
 };
 
-// Vapi API integration for outbound calls
-const createVapiCall = async (runId, conferenceSid) => {
-  try {
-    const callPayload = {
-      assistantId: config.vapi.assistantId,
-      customer: {
-        number: `conference:${conferenceSid}` // Special Twilio conference dial string
-      },
-      phoneNumberId: config.vapi.phoneNumber, // Your Vapi phone number ID
-      metadata: {
-        runId,
-        role: 'interviewer'
-      }
-    };
-
-    const response = await axios.post(
-      'https://api.vapi.ai/call',
-      callPayload,
-      {
-        headers: {
-          'Authorization': `Bearer ${config.vapi.apiKey}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    return response.data;
-  } catch (error) {
-    logger.error('Failed to create Vapi call', error.response?.data || error.message);
-    throw error;
-  }
-};
-
-// Ultravox API integration - modified to work with conference
-const createUltravoxCall = async (persona, runId, conferenceSid) => {
-  try {
-    const selectedPersona = personas[persona] || personas.nervous;
-    
-    const callPayload = {
-      systemPrompt: `You are a ${selectedPersona.name}. ${selectedPersona.description} 
-        You are being interviewed for a software engineering position. 
-        Respond naturally as this persona would. Keep responses concise but in character.
-        Traits: ${selectedPersona.traits.join(', ')}.
-        
-        You will be connected to a conference call with an interviewer. Wait for questions and respond appropriately.`,
-      model: "fixie-ai/ultravox",
-      voice: selectedPersona.voice,
-      temperature: 0.7,
-      maxDuration: 300, // 5 minutes
-      // Try to pass conference info if Ultravox supports it
-      callTarget: conferenceSid, 
-      metadata: {
-        runId,
-        persona: selectedPersona.name,
-        conferenceSid
-      }
-    };
-
-    const response = await axios.post(
-      `${config.ultravox.apiUrl}/calls`,
-      callPayload,
-      {
-        headers: {
-          'Authorization': `Bearer ${config.ultravox.apiKey}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    return response.data;
-  } catch (error) {
-    logger.error('Failed to create Ultravox call', error.response?.data || error.message);
-    throw error;
-  }
-};
-
-// Main test orchestration
+// Simplified test function with better error handling
 const startTest = async (req, res) => {
   const { persona = 'nervous', scenarioId = 'default' } = req.body;
   const runId = generateRunId();
@@ -208,110 +126,50 @@ const startTest = async (req, res) => {
   try {
     logger.info(`Starting test run ${runId} with persona: ${persona}`);
     
-    // Debug: Check if twilioClient is properly initialized
-    if (!twilioClient || typeof twilioClient.conferences !== 'object') {
-      throw new Error('Twilio client not properly initialized');
+    // Test Twilio client first
+    if (!twilioClient) {
+      throw new Error('Twilio client not initialized');
     }
-    
-    // Step 1: Create Twilio Conference
+
+    // Create Twilio Conference with simpler configuration
     const conference = await twilioClient.conferences.create({
       friendlyName: `AI_Interview_${runId}`,
-      record: 'record-from-start',
       statusCallback: `${config.twilio.webhookUrl}/twilio/status`,
-      statusCallbackEvent: ['start', 'end', 'join', 'leave'],
+      statusCallbackEvent: ['start', 'end'],
       endConferenceOnExit: false,
-      maxParticipants: 2
+      maxParticipants: 3
     });
 
-    logger.info(`Conference created: ${conference.sid}`);
+    logger.info(`✅ Conference created: ${conference.sid}`);
 
-    // Step 2: Store test run
+    // Store test run
     storage.testRuns.set(runId, {
       runId,
       scenarioId,
       persona,
       conferenceSid: conference.sid,
-      status: 'starting',
+      status: 'created',
       startTime: new Date().toISOString(),
       participants: {}
     });
 
     saveEvent(runId, 'test_started', { persona, scenarioId, conferenceSid: conference.sid });
 
-    // Step 3: Start both calls to join the conference
-    // Step 3a: Add Interview Bot (Vapi) via PSTN
-    const vapiParticipant = await twilioClient.conferences(conference.sid)
-      .participants
-      .create({
-        to: config.vapi.phoneNumber, // Your Vapi phone number
-        from: '+15005550006', // Twilio test number
-        statusCallback: `${config.twilio.webhookUrl}/twilio/participant-status`,
-        statusCallbackEvent: ['ringing', 'answered', 'completed'],
-        label: 'interviewer',
-        statusCallbackMethod: 'POST'
-      });
-
-    logger.info(`Vapi participant added: ${vapiParticipant.callSid}`);
-
-    // Wait a moment for first bot to settle and answer
-    setTimeout(async () => {
-      try {
-        // Step 3b: Create Ultravox call that joins the conference
-        const ultravoxCall = await createUltravoxCall(persona, runId, conference.sid);
-        let ultravoxTarget;
-        
-        if (ultravoxCall.joinUrl) {
-          // If Ultravox provides a SIP URI
-          ultravoxTarget = ultravoxCall.joinUrl;
-        } else {
-          // If Ultravox provides a phone number
-          ultravoxTarget = ultravoxCall.phoneNumber || `+1${ultravoxCall.callId}`;
-        }
-
-        const ultravoxParticipant = await twilioClient.conferences(conference.sid)
-          .participants
-          .create({
-            to: ultravoxTarget,
-            from: '+15005550006',
-            statusCallback: `${config.twilio.webhookUrl}/twilio/participant-status`,
-            statusCallbackEvent: ['ringing', 'answered', 'completed'],
-            label: 'candidate'
-          });
-
-        logger.info(`Ultravox participant added: ${ultravoxParticipant.callSid}`);
-
-        // Update storage
-        const testRun = storage.testRuns.get(runId);
-        testRun.participants = {
-          interviewer: { callSid: vapiParticipant.callSid, vendor: 'vapi', phoneNumber: config.vapi.phoneNumber },
-          candidate: { callSid: ultravoxParticipant.callSid, vendor: 'ultravox', target: ultravoxTarget }
-        };
-        testRun.status = 'running';
-
-        saveEvent(runId, 'participants_added', testRun.participants);
-
-        // Set timeout to auto-stop test
-        setTimeout(() => stopTest(runId), config.testTimeout);
-
-      } catch (error) {
-        logger.error(`Failed to add second participant for ${runId}`, error);
-      }
-    }, 5000); // Wait 5 seconds for Vapi to answer and settle
-
     res.json({
       success: true,
       runId,
       conferenceSid: conference.sid,
-      status: 'starting',
-      message: 'Test initiated. Bots joining conference...'
+      status: 'created',
+      message: 'Test conference created successfully!'
     });
 
   } catch (error) {
-    logger.error(`Failed to start test ${runId}`, error);
+    logger.error(`❌ Failed to start test ${runId}:`, error.message);
     res.status(500).json({
       success: false,
       error: error.message,
-      runId
+      runId,
+      details: 'Check server logs for more information'
     });
   }
 };
@@ -327,8 +185,10 @@ const stopTest = async (runId) => {
     logger.info(`Stopping test run ${runId}`);
 
     // End the conference
-    await twilioClient.conferences(testRun.conferenceSid)
-      .update({ status: 'completed' });
+    if (testRun.conferenceSid) {
+      await twilioClient.conferences(testRun.conferenceSid)
+        .update({ status: 'completed' });
+    }
 
     // Update status
     testRun.status = 'completed';
@@ -338,19 +198,16 @@ const stopTest = async (runId) => {
       duration: new Date(testRun.endTime) - new Date(testRun.startTime)
     });
 
-    logger.info(`Test run ${runId} completed`);
+    logger.info(`✅ Test run ${runId} completed`);
 
   } catch (error) {
-    logger.error(`Failed to stop test ${runId}`, error);
+    logger.error(`❌ Failed to stop test ${runId}:`, error.message);
   }
 };
 
 // API Endpoints
-
-// Start a new test
 app.post('/tests/start', startTest);
 
-// Stop a test manually
 app.post('/tests/:runId/stop', async (req, res) => {
   const { runId } = req.params;
   
@@ -362,7 +219,6 @@ app.post('/tests/:runId/stop', async (req, res) => {
   }
 });
 
-// Get test status
 app.get('/tests/:runId', (req, res) => {
   const { runId } = req.params;
   const testRun = storage.testRuns.get(runId);
@@ -382,36 +238,27 @@ app.get('/tests/:runId', (req, res) => {
   });
 });
 
-// List all tests
 app.get('/tests', (req, res) => {
   const tests = Array.from(storage.testRuns.values());
   res.json({ success: true, tests });
 });
 
-// Twilio voice webhook (for conference setup)
+// Twilio webhooks
 app.post('/twilio/voice', (req, res) => {
   const { CallSid, From, To } = req.body;
+  logger.info('📞 Voice webhook received', { CallSid, From, To });
   
-  logger.info('Incoming voice webhook', { CallSid, From, To });
-  
-  // Simple TwiML response - join conference if needed
   const twiml = new twilio.twiml.VoiceResponse();
-  
-  // For demo purposes, you could create a conference here too
-  // But we're primarily using REST API approach
-  twiml.say('Connecting to AI interview system...');
+  twiml.say('Hello from AI Interview System');
   
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-// Twilio status callbacks
 app.post('/twilio/status', (req, res) => {
   const { ConferenceSid, StatusCallbackEvent, FriendlyName } = req.body;
+  logger.info('📊 Conference status event', { ConferenceSid, StatusCallbackEvent, FriendlyName });
   
-  logger.info('Conference status event', { ConferenceSid, StatusCallbackEvent, FriendlyName });
-  
-  // Find test run by conference SID
   const testRun = Array.from(storage.testRuns.values())
     .find(run => run.conferenceSid === ConferenceSid);
   
@@ -425,75 +272,37 @@ app.post('/twilio/status', (req, res) => {
   res.sendStatus(200);
 });
 
-// Participant status callbacks
-app.post('/twilio/participant-status', (req, res) => {
-  const { CallSid, ConferenceSid, StatusCallbackEvent, Label } = req.body;
-  
-  logger.info('Participant status event', { CallSid, ConferenceSid, StatusCallbackEvent, Label });
-  
-  // Find test run and update participant status
-  const testRun = Array.from(storage.testRuns.values())
-    .find(run => run.conferenceSid === ConferenceSid);
-  
-  if (testRun) {
-    saveEvent(testRun.runId, 'participant_event', { 
-      event: StatusCallbackEvent,
-      callSid: CallSid,
-      label: Label 
-    });
-
-    // Update participant connection times
-    if (testRun.participants) {
-      Object.keys(testRun.participants).forEach(role => {
-        if (testRun.participants[role].callSid === CallSid) {
-          if (StatusCallbackEvent === 'answered') {
-            testRun.participants[role].connectTime = new Date().toISOString();
-          } else if (StatusCallbackEvent === 'completed') {
-            testRun.participants[role].disconnectTime = new Date().toISOString();
-          }
-        }
-      });
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    activeTests: Array.from(storage.testRuns.values()).filter(t => t.status === 'running').length,
+    totalTests: storage.testRuns.size,
+    config: {
+      twilioConfigured: !!(config.twilio.accountSid && config.twilio.authToken),
+      vapiConfigured: !!(config.vapi.apiKey && config.vapi.assistantId),
+      ultravoxConfigured: !!config.ultravox.apiKey
     }
+  });
+});
+
+// Debug endpoint
+app.get('/debug/twilio', async (req, res) => {
+  try {
+    const account = await twilioClient.api.accounts(config.twilio.accountSid).fetch();
+    res.json({
+      success: true,
+      account: account.friendlyName,
+      conferencesAvailable: typeof twilioClient.conferences.create === 'function',
+      twilioVersion: require('twilio/package.json').version
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
-  
-  res.sendStatus(200);
-});
-
-// Vapi webhooks for transcripts
-app.post('/webhooks/vapi/transcript', (req, res) => {
-  const { transcript, isFinal, callId } = req.body;
-  
-  logger.debug('Vapi transcript received', { transcript, isFinal });
-  
-  // Find test run by call ID (you'd need to track this mapping)
-  // For simplicity, we'll use a different approach in the real implementation
-  
-  res.sendStatus(200);
-});
-
-// Ultravox webhooks for transcripts
-app.post('/webhooks/ultravox/transcript', (req, res) => {
-  const { transcript, isFinal, callId } = req.body;
-  
-  logger.debug('Ultravox transcript received', { transcript, isFinal });
-  
-  // Store transcript
-  // Note: You'll need to map callId to runId in production
-  
-  res.sendStatus(200);
-});
-
-// Generic transcript webhook (simplified for demo)
-app.post('/webhooks/transcript/:vendor/:runId', (req, res) => {
-  const { vendor, runId } = req.params;
-  const { transcript, is_final, speaker } = req.body;
-  
-  logger.info(`Transcript from ${vendor}`, { runId, transcript, is_final });
-  
-  const participantType = vendor === 'vapi' ? 'interviewer' : 'candidate';
-  saveTranscript(runId, participantType, transcript, is_final);
-  
-  res.sendStatus(200);
 });
 
 // Simple web interface
@@ -504,37 +313,45 @@ app.get('/', (req, res) => {
     <head>
         <title>AI Interview Test System</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
+            body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
             .form-group { margin: 20px 0; }
             label { display: block; margin-bottom: 5px; font-weight: bold; }
-            select, button { padding: 10px; margin: 5px 0; }
-            button { background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #0052a3; }
-            .status { margin: 20px 0; padding: 15px; border-radius: 4px; }
+            select, button { padding: 12px; margin: 5px 0; border-radius: 5px; border: 1px solid #ddd; }
+            button { background: #007bff; color: white; border: none; cursor: pointer; font-weight: bold; }
+            button:hover { background: #0056b3; }
+            .status { margin: 20px 0; padding: 15px; border-radius: 5px; }
             .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
             .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+            .info { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
             .test-list { margin-top: 30px; }
-            .test-item { padding: 10px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; }
-            pre { background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto; }
+            .test-item { padding: 15px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; background: #f8f9fa; }
+            pre { background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+            .header { text-align: center; margin-bottom: 30px; }
+            .emoji { font-size: 2em; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🤖 AI Interview Test System</h1>
+            <div class="header">
+                <div class="emoji">🤖</div>
+                <h1>AI Interview Test System</h1>
+                <p>Test AI-powered interviews with different candidate personas</p>
+            </div>
             
             <div class="form-group">
-                <label for="persona">Candidate Persona:</label>
-                <select id="persona">
-                    <option value="nervous">Nervous Fresher</option>
-                    <option value="confident">Overconfident Candidate</option>
-                    <option value="experienced">Senior Professional</option>
+                <label for="persona">Select Candidate Persona:</label>
+                <select id="persona" style="width: 100%;">
+                    <option value="nervous">🤷 Nervous Fresher - Anxious recent graduate</option>
+                    <option value="confident">😎 Overconfident Candidate - Assertive and direct</option>
+                    <option value="experienced">👔 Senior Professional - Calm and experienced</option>
                 </select>
             </div>
 
             <div class="form-group">
-                <button onclick="startTest()">🚀 Start Interview Test</button>
-                <button onclick="loadTests()">📋 Refresh Test List</button>
+                <button onclick="startTest()" style="width: 200px; margin-right: 10px;">🚀 Start Test</button>
+                <button onclick="loadTests()" style="width: 150px; background: #28a745;">📋 Refresh</button>
+                <button onclick="checkHealth()" style="width: 150px; background: #6c757d;">💓 Health Check</button>
             </div>
 
             <div id="status"></div>
@@ -549,7 +366,7 @@ app.get('/', (req, res) => {
                 const statusDiv = document.getElementById('status');
                 
                 try {
-                    statusDiv.innerHTML = '<div class="status">Starting test...</div>';
+                    statusDiv.innerHTML = '<div class="status info">🔄 Starting test conference...</div>';
                     
                     const response = await fetch('/tests/start', {
                         method: 'POST',
@@ -563,66 +380,46 @@ app.get('/', (req, res) => {
                         currentRunId = result.runId;
                         statusDiv.innerHTML = \`
                             <div class="status success">
-                                ✅ Test Started!<br>
-                                Run ID: \${result.runId}<br>
-                                Conference: \${result.conferenceSid}<br>
-                                Status: \${result.status}
+                                ✅ Conference Created Successfully!<br><br>
+                                <strong>Run ID:</strong> \${result.runId}<br>
+                                <strong>Conference:</strong> \${result.conferenceSid}<br>
+                                <strong>Status:</strong> \${result.status}<br>
+                                <strong>Message:</strong> \${result.message}
                             </div>
                         \`;
-                        
-                        // Auto-refresh status
-                        setTimeout(() => checkStatus(result.runId), 5000);
-                    } else {
-                        statusDiv.innerHTML = \`<div class="status error">❌ Error: \${result.error}</div>\`;
-                    }
-                } catch (error) {
-                    statusDiv.innerHTML = \`<div class="status error">❌ Request failed: \${error.message}</div>\`;
-                }
-            }
-
-            async function stopTest(runId) {
-                try {
-                    const response = await fetch(\`/tests/\${runId}/stop\`, { method: 'POST' });
-                    const result = await response.json();
-                    
-                    if (result.success) {
                         loadTests();
+                    } else {
+                        statusDiv.innerHTML = \`
+                            <div class="status error">
+                                ❌ <strong>Error:</strong> \${result.error}<br>
+                                \${result.details ? '<br><strong>Details:</strong> ' + result.details : ''}
+                            </div>
+                        \`;
                     }
                 } catch (error) {
-                    console.error('Failed to stop test:', error);
+                    statusDiv.innerHTML = \`<div class="status error">❌ <strong>Request failed:</strong> \${error.message}</div>\`;
                 }
             }
 
-            async function checkStatus(runId) {
+            async function checkHealth() {
+                const statusDiv = document.getElementById('status');
                 try {
-                    const response = await fetch(\`/tests/\${runId}\`);
+                    const response = await fetch('/health');
                     const result = await response.json();
                     
-                    if (result.success) {
-                        const { testRun, transcripts, events } = result;
-                        
-                        document.getElementById('status').innerHTML = \`
-                            <div class="status">
-                                <strong>Test: \${runId}</strong><br>
-                                Status: \${testRun.status}<br>
-                                Persona: \${testRun.persona}<br>
-                                Events: \${events.length}<br>
-                                Transcripts: \${transcripts.length}
-                                
-                                \${testRun.status === 'running' ? 
-                                    \`<button onclick="stopTest('\${runId}')" style="margin-top: 10px;">⏹️ Stop Test</button>\` : 
-                                    ''
-                                }
-                            </div>
-                        \`;
-                        
-                        // Continue checking if still running
-                        if (testRun.status === 'running') {
-                            setTimeout(() => checkStatus(runId), 10000);
-                        }
-                    }
+                    statusDiv.innerHTML = \`
+                        <div class="status info">
+                            💓 <strong>System Health Check</strong><br><br>
+                            <strong>Status:</strong> \${result.status}<br>
+                            <strong>Active Tests:</strong> \${result.activeTests}<br>
+                            <strong>Total Tests:</strong> \${result.totalTests}<br>
+                            <strong>Twilio:</strong> \${result.config.twilioConfigured ? '✅' : '❌'}<br>
+                            <strong>Vapi:</strong> \${result.config.vapiConfigured ? '✅' : '❌'}<br>
+                            <strong>Ultravox:</strong> \${result.config.ultravoxConfigured ? '✅' : '❌'}
+                        </div>
+                    \`;
                 } catch (error) {
-                    console.error('Failed to check status:', error);
+                    statusDiv.innerHTML = \`<div class="status error">❌ Health check failed: \${error.message}</div>\`;
                 }
             }
 
@@ -635,28 +432,49 @@ app.get('/', (req, res) => {
                         const testListDiv = document.getElementById('testList');
                         
                         if (result.tests.length === 0) {
-                            testListDiv.innerHTML = '<p>No tests yet. Start your first test above!</p>';
+                            testListDiv.innerHTML = '<div class="info">📋 <strong>No tests yet.</strong> Start your first test above!</div>';
                             return;
                         }
                         
                         const testItems = result.tests.map(test => \`
                             <div class="test-item">
-                                <strong>\${test.runId}</strong> 
-                                <span style="color: #666;">[\${test.status}]</span><br>
-                                Persona: \${test.persona} | 
-                                Started: \${new Date(test.startTime).toLocaleTimeString()}<br>
-                                Conference: \${test.conferenceSid}
-                                <button onclick="viewDetails('\${test.runId}')" style="margin-left: 10px;">View Details</button>
+                                <strong>🧪 \${test.runId}</strong> 
+                                <span style="padding: 3px 8px; border-radius: 3px; font-size: 12px; background: \${test.status === 'completed' ? '#28a745' : '#007bff'}; color: white;">
+                                    \${test.status.toUpperCase()}
+                                </span><br>
+                                <strong>Persona:</strong> \${test.persona} | 
+                                <strong>Started:</strong> \${new Date(test.startTime).toLocaleString()}<br>
+                                <strong>Conference:</strong> \${test.conferenceSid}
+                                <br>
+                                <button onclick="viewDetails('\${test.runId}')" style="margin-top: 10px; font-size: 12px; padding: 5px 10px;">📊 View Details</button>
+                                \${test.status !== 'completed' ? 
+                                    \`<button onclick="stopTest('\${test.runId}')" style="margin-top: 10px; margin-left: 5px; font-size: 12px; padding: 5px 10px; background: #dc3545;">⏹️ Stop</button>\` : 
+                                    ''
+                                }
                             </div>
                         \`).join('');
                         
                         testListDiv.innerHTML = \`
-                            <h3>Recent Tests</h3>
+                            <h3>📋 Recent Tests (\${result.tests.length})</h3>
                             \${testItems}
                         \`;
                     }
                 } catch (error) {
                     console.error('Failed to load tests:', error);
+                }
+            }
+
+            async function stopTest(runId) {
+                try {
+                    const response = await fetch(\`/tests/\${runId}/stop\`, { method: 'POST' });
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        loadTests();
+                        document.getElementById('status').innerHTML = '<div class="status info">⏹️ Test stopped successfully</div>';
+                    }
+                } catch (error) {
+                    console.error('Failed to stop test:', error);
                 }
             }
 
@@ -668,115 +486,93 @@ app.get('/', (req, res) => {
                     if (result.success) {
                         const { testRun, transcripts, events } = result;
                         
-                        const detailsWindow = window.open('', '_blank');
+                        const detailsWindow = window.open('', '_blank', 'width=800,height=600');
                         detailsWindow.document.write(\`
+                            <!DOCTYPE html>
                             <html>
-                            <head><title>Test Details: \${runId}</title></head>
-                            <body style="font-family: Arial, sans-serif; margin: 20px;">
-                                <h2>Test Run: \${runId}</h2>
+                            <head>
+                                <title>Test Details: \${runId}</title>
+                                <style>body { font-family: Arial, sans-serif; margin: 20px; } pre { background: #f8f9fa; padding: 15px; border-radius: 5px; overflow-x: auto; }</style>
+                            </head>
+                            <body>
+                                <h2>📊 Test Run Details: \${runId}</h2>
                                 <p><strong>Status:</strong> \${testRun.status}</p>
                                 <p><strong>Persona:</strong> \${testRun.persona}</p>
-                                <p><strong>Duration:</strong> \${testRun.startTime} - \${testRun.endTime || 'ongoing'}</p>
+                                <p><strong>Conference SID:</strong> \${testRun.conferenceSid}</p>
+                                <p><strong>Start Time:</strong> \${new Date(testRun.startTime).toLocaleString()}</p>
+                                <p><strong>End Time:</strong> \${testRun.endTime ? new Date(testRun.endTime).toLocaleString() : 'N/A'}</p>
                                 
-                                <h3>Events (\${events.length})</h3>
+                                <h3>📅 Events (\${events.length})</h3>
                                 <pre>\${JSON.stringify(events, null, 2)}</pre>
                                 
-                                <h3>Transcripts (\${transcripts.length})</h3>
+                                <h3>📝 Transcripts (\${transcripts.length})</h3>
                                 <pre>\${JSON.stringify(transcripts, null, 2)}</pre>
+                                
+                                <button onclick="window.close()" style="margin-top: 20px; padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close</button>
                             </body>
                             </html>
                         \`);
+                        detailsWindow.document.close();
                     }
                 } catch (error) {
                     alert('Failed to load details: ' + error.message);
                 }
             }
 
-            // Load tests on page load
-            loadTests();
+            // Auto-load tests on page load
+            window.addEventListener('load', () => {
+                loadTests();
+                checkHealth();
+            });
         </script>
     </body>
     </html>
   `);
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    activeTests: Array.from(storage.testRuns.values()).filter(t => t.status === 'running').length,
-    totalTests: storage.testRuns.size
-  });
-});
-
 // Error handling middleware
 app.use((error, req, res, next) => {
-  logger.error('Unhandled error', error);
+  logger.error('Unhandled error:', error.message);
   res.status(500).json({
     success: false,
     error: 'Internal server error'
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('Shutting down gracefully...');
-  
-  // Stop any running tests
-  const runningTests = Array.from(storage.testRuns.values())
-    .filter(test => test.status === 'running');
-  
-  for (const test of runningTests) {
-    try {
-      await stopTest(test.runId);
-    } catch (error) {
-      logger.error(`Failed to stop test ${test.runId} during shutdown`, error);
-    }
-  }
-  
-  process.exit(0);
-});
-
-// Start server with proper error handling
+// Start server
 const startServer = async () => {
   try {
     // Test Twilio connection
-    logger.info('Testing Twilio connection...');
+    logger.info('🔍 Testing Twilio connection...');
     const account = await twilioClient.api.accounts(config.twilio.accountSid).fetch();
     logger.info('✅ Twilio connection verified', { accountName: account.friendlyName });
     
-    // Test conferences API
-    logger.info('Testing Twilio conferences API...');
-    if (typeof twilioClient.conferences.create !== 'function') {
-      throw new Error('Twilio conferences API not available - check SDK version');
-    }
-    logger.info('✅ Twilio conferences API available');
-    
+    // Start server
     app.listen(config.port, () => {
       logger.info(`🚀 AI Interview System running on port ${config.port}`);
-      logger.info('📋 Configuration check:');
-      logger.info(`   Twilio Account: ${config.twilio.accountSid} ✅`);
-      logger.info(`   Webhook URL: ${config.twilio.webhookUrl}`);
-      logger.info(`   Vapi Phone: ${config.vapi.phoneNumber} ✅`);
-      logger.info(`   Vapi Assistant: ${config.vapi.assistantId ? '✅' : '❌'}`);
-      logger.info(`   Ultravox API: ${config.ultravox.apiUrl}`);
-      logger.info('\n🎯 Ready to start AI interview tests!');
-      logger.info('   Open http://localhost:' + config.port + ' to begin');
+      logger.info('📋 System Status:');
+      logger.info(`   ✅ Twilio Account: ${config.twilio.accountSid.substring(0, 10)}...`);
+      logger.info(`   📡 Webhook URL: ${config.twilio.webhookUrl}`);
+      logger.info(`   📞 Vapi Phone: ${config.vapi.phoneNumber || '❌ Not configured'}`);
+      logger.info(`   🎭 Ultravox API: ${config.ultravox.apiUrl}`);
+      logger.info('\n🎯 System ready! Visit your Render URL to start testing.');
     });
     
   } catch (error) {
     logger.error('❌ Failed to start server:', error.message);
-    logger.error('💡 Common fixes:');
-    logger.error('   - Verify TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are correct');
-    logger.error('   - Check your internet connection');
-    logger.error('   - Ensure Twilio account is active');
-    logger.error('   - Update Twilio SDK: npm install twilio@latest');
+    logger.error('💡 Troubleshooting tips:');
+    logger.error('   - Verify TWILIO_ACCOUNT_SID starts with "AC"');
+    logger.error('   - Check TWILIO_AUTH_TOKEN is correct');
+    logger.error('   - Ensure Twilio account is active and funded');
     process.exit(1);
   }
 };
 
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('👋 Shutting down gracefully...');
+  process.exit(0);
+});
+
 // Start the server
 startServer();
-
-module.exports = app;
